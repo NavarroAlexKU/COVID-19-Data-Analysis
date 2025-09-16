@@ -1,0 +1,1016 @@
+---
+title: "COVID-19 Data Report Final"
+author: "Alex Navarro"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: show
+    df_print: kable
+    theme: cosmo
+    highlight: tango
+    number_sections: false
+    css: styles.css
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: false
+    df_print: kable
+    latex_engine: xelatex
+    includes:
+      in_header: header.tex
+link-citations: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 100
+)
+
+```
+
+# **Project Overview**
+
+**Goal:**
+
+* Analyze global COVID-19 case and death data from the Johns Hopkins CSSE repository.  
+* Use feature engineering and clustering techniques to uncover patterns in epidemic dynamics across countries and provinces.  
+
+**Steps Taken:**
+
+* Imported and cleaned cumulative case and death time series for the U.S. and global regions.  
+* Handled missing values through imputation (median at province/country level) and removal where appropriate.  
+* Engineered features capturing outbreak scale, volatility, growth, and severity (case fatality ratio).  
+* Applied k-means clustering to group regions into 5 clusters, chosen using the elbow method.  
+* Visualized results with PCA scatter plots, cluster size distributions, and heatmaps of cluster profiles.  
+
+**Outcome:**
+
+* Identified meaningful groupings of regions with similar outbreak characteristics.  
+* Demonstrated how unsupervised learning methods can provide exploratory insights into global health data.  
+* Highlighted limitations and biases in the dataset and methodology, addressed in the conclusion section.  
+
+------------------------------------------------------------------------
+
+# **Import Packages**
+
+```{r Import-packages, message = FALSE, warning = FALSE}
+# ── Core Data Science Toolkit ──────────────────────
+library(tidyverse)  # dplyr, tidyr, ggplot2, readr, purrr, tibble, stringr, forcats
+
+# ── Data Cleaning ─────────────────────────────────
+library(janitor)    # clean names, tabyl, etc.
+
+# ── Date/Time Handling ────────────────────────────
+library(lubridate)  # parse/handle dates & times
+
+# ── Modeling & ML ─────────────────────────────────
+library(caret)      # ML training/evaluation
+library(Matrix)     # sparse matrices
+library(purrr)    # kmeans
+
+# ── Visualization ─────────────────────────────────
+library(ROCR)       # ROC curves, performance metrics
+library(scales)     # extra scales for ggplot2
+library(patchwork)  # combine multiple ggplots
+library(PRROC)
+
+# ── Global ggplot theme (Color-blind friendly) ─────
+okabe_ito <- c(
+  "#E69F00", # orange
+  "#56B4E9", # sky blue
+  "#009E73", # bluish green
+  "#F0E442", # yellow
+  "#0072B2", # blue
+  "#D55E00", # vermillion
+  "#CC79A7", # reddish purple
+  "#999999"  # grey
+)
+
+theme_set(
+  theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size = 9),
+      legend.title = element_text(size = 10)
+    )
+)
+
+scale_colour_discrete <- function(...) scale_colour_manual(values = okabe_ito, ...)
+scale_fill_discrete   <- function(...) scale_fill_manual(values = okabe_ito, ...)
+
+
+```
+
+------------------------------------------------------------------------
+
+# **Import Data**
+
+* The data comes from the **Johns Hopkins University Center for Systems Science and Engineering (JHU CSSE)** COVID-19 dataset.  
+* It is hosted on their **public GitHub repository**:  
+  [CSSEGISandData/COVID-19](https://github.com/CSSEGISandData/COVID-19)
+
+* Specifically, we are using the **time series data files**:  
+  * `time_series_covid19_confirmed_US.csv` → Cumulative confirmed cases for U.S. states/counties  
+  * `time_series_covid19_confirmed_global.csv` → Cumulative confirmed cases worldwide (country/province level)  
+  * `time_series_covid19_deaths_US.csv` → Cumulative deaths for U.S. states/counties  
+  * `time_series_covid19_deaths_global.csv` → Cumulative deaths worldwide (country/province level)
+
+* These files contain **daily cumulative counts** of COVID-19 cases and deaths, reported at different geographic resolutions (U.S. counties/states vs. global countries/provinces).  
+* They are widely used in academic, government, and industry research for **pandemic tracking, modeling, and forecasting**.
+
+```{r Import-data}
+
+# Base path
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/refs/heads/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+# Files (US first, then global)
+file_names <- c(
+  "time_series_covid19_confirmed_US.csv",
+  "time_series_covid19_confirmed_global.csv",
+  "time_series_covid19_deaths_US.csv",
+  "time_series_covid19_deaths_global.csv"
+)
+
+# Build full URLs
+urls <- str_c(url_in, file_names)
+
+# ✅ Correct assignments
+us_cases      <- read_csv(urls[1], show_col_types = FALSE)
+global_cases  <- read_csv(urls[2], show_col_types = FALSE)
+us_deaths     <- read_csv(urls[3], show_col_types = FALSE)
+global_deaths <- read_csv(urls[4], show_col_types = FALSE)
+
+
+```
+
+------------------------------------------------------------------------
+
+# **Data Cleaning**
+
+**What this step does:**
+
+* Reshapes the cases dataset from wide format (many date columns) into long format where each row = one (Country, Province, Date).
+* Converts text dates into proper Date objects for time-series analysis.
+* Removes extra columns (IDs, coordinates, codes) that aren’t needed.
+* Filters the data to keep only rows with at least 1 reported case.
+* Rename applicable columns.
+
+```{r melt-columns-global-cases}
+
+# Reshape the global cases dataset from wide format to long format
+global_cases <- global_cases %>%
+  pivot_longer(
+    # Select only the date columns (formatted like M/D/YY)
+    cols = matches("^\\d{1,2}/\\d{1,2}/\\d{2}$"),
+    names_to  = "date",
+    values_to = "cases"
+  ) %>%
+  # Convert text dates into proper Date format
+  mutate(date = mdy(date)) %>%
+  # Rename columns so they match our naming convention
+  rename(
+    Country_Region = `Country/Region`,
+    Province_State = `Province/State`
+  ) %>%
+  # Drop extra ID/coordinate columns not needed
+  select(-any_of(c("Lat","Long","Long_","UID","iso2","iso3","code3","FIPS","Admin2"))) %>%
+  # Keep only rows with at least 1 case
+  filter(cases >= 1)
+
+```
+
+Lets print the head of the clean global cases data frame.
+
+```{r check-dataframe1}
+
+# Check first 5 rows of data frame global_cases:
+head(global_cases)
+
+```
+
+**What this step does:**
+
+* Reshapes the deaths dataset from wide format (many date columns) into long format where each row = one (Country, Province, Date).
+* Converts text dates (e.g., "1/22/20") into proper Date objects.
+* Drops rows where deaths are missing, and filters out values less than 1.
+* Renames columns (`Country/Region` → `Country_Region`, `Province/State` → `Province_State`) so they match the cases dataset.
+* Removes extra columns like latitude/longitude that aren’t needed for analysis.
+
+```{r melt-columns-global-deaths}
+
+# Reshape the deaths dataset into long format
+global_deaths <- global_deaths %>%
+  pivot_longer(
+    # Use only the date columns (formatted like M/D/YY)
+    cols = matches("^\\d{1,2}/\\d{1,2}/\\d{2}$"),
+    names_to  = "date",
+    values_to = "deaths"
+  ) %>%
+  # Convert date text to proper date format
+  mutate(date = mdy(date)) %>%
+  # Remove rows with missing values
+  tidyr::drop_na(deaths) %>%
+  # Keep only rows with at least 1 death
+  filter(deaths >= 1) %>%
+  # Rename columns so they match the cases dataset
+  rename(
+    Country_Region = `Country/Region`,
+    Province_State = `Province/State`
+  ) %>%
+  # Drop coordinates
+  select(-any_of(c("Lat","Long")))
+
+```
+
+Lets print the first 5 rows of the cleaned global_deaths dataset.
+
+```{r check-dataframe2}
+
+# Check first 5 rows of dataframe: global_deaths
+head(global_deaths, n = 5)
+
+```
+
+**What this step does:**
+
+* Cleans and standardizes the key columns (`Country_Region`, `Province_State`, `date`) so both datasets line up correctly.
+* Replaces blank or missing province values with `"All"` so entire countries without state-level data are still included.
+* Aggregates duplicate rows by summing case and death counts for each (Country, Province, Date) combination.
+* Joins the two datasets into a single `global` table that contains both **cases** and **deaths** side by side.
+
+```{r join-standardize-and-check}
+
+# ---- 1) Standardize keys on BOTH tables ----
+std_keys <- function(df) {
+  df %>%
+    mutate(
+      Country_Region = str_trim(as.character(Country_Region)),        # trim extra spaces
+      Province_State = ifelse(is.na(Province_State) | Province_State == "", 
+                              "All", as.character(Province_State)),   # replace blanks/NA with "All"
+      date = as.Date(date)                                            # ensure proper Date format
+    )
+}
+
+# Apply cleaning function to both datasets
+global_cases  <- std_keys(global_cases)  %>% select(-any_of("Combined_Key"))  # drop extra string key
+global_deaths <- std_keys(global_deaths)
+
+# ---- 2) Aggregate (handles duplicates or multiple rows per key) ----
+cases_state <- global_cases %>%
+  group_by(Country_Region, Province_State, date) %>%
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+deaths_state <- global_deaths %>%
+  group_by(Country_Region, Province_State, date) %>%
+  summarise(deaths = sum(deaths, na.rm = TRUE), .groups = "drop")
+
+# ---- 3) Join on clean keys ----
+global <- full_join(
+  cases_state, deaths_state,
+  by = c("Country_Region", "Province_State", "date")
+)
+
+```
+
+Lets see what the dataframe looks like after we standardize and join.
+
+```{r check-dataframe4}
+
+# Check last 20 rows of global
+tail(global, n = 20)
+
+```
+
+**What this step does:**
+
+* Reshapes the raw US cases dataset from wide (many date columns) into long format where each row = one (State/County, Date).
+* Converts text dates into proper Date objects.
+* Removes extra ID and coordinate columns that aren’t needed.
+* Keeps the Population column.
+* Filters out rows with zero cases to focus on meaningful data.
+
+```{r melt-columns-us-cases}
+
+# Reshape the US cases dataset from wide format to long format
+us_cases <- us_cases %>%
+  pivot_longer(
+    # Select only the date columns (formatted like M/D/YY)
+    cols = matches("^\\d{1,2}/\\d{1,2}/\\d{2}$"),
+    # Rename those columns to "date" and their values to "cases"
+    names_to  = "date",
+    values_to = "cases"
+  ) %>%
+  # Convert text dates into proper Date format
+  mutate(date = mdy(date)) %>%
+  # Keep useful columns (drop IDs/coordinates not needed)
+  select(-any_of(c("UID","iso2","iso3","code3","FIPS","Lat","Long_","Admin2"))) %>%
+  # Keep only rows with at least 1 reported case
+  filter(cases >= 1)
+
+```
+
+Lets check the first 10 rows of the cleaned us_cases data frame.
+
+```{r check-dataframe5}
+
+head(us_cases, n = 10)
+
+```
+
+**What this step does:**
+
+* Reshapes the raw US deaths dataset from wide format (many date columns) into long format where each row = one (State/County, Date).
+* Converts text dates (M/D/YY) into proper Date objects for time-series analysis.
+* Removes extra columns (`Lat`, `Long_`, `UID`, `iso2`, `iso3`. `code3`, `FIPS`) that aren’t needed for aggregation.
+* Rename columns
+* Filters out rows with zero deaths to focus on meaningful data.
+
+```{r melt-columns-us-deaths}
+
+# Reshape the US deaths dataset from wide format to long format
+us_deaths <- us_deaths %>%
+  pivot_longer(
+    # Select only the date columns (formatted like M/D/YY)
+    cols = matches("^\\d{1,2}/\\d{1,2}/\\d{2}$"),
+    names_to  = "date",
+    values_to = "deaths"
+  ) %>%
+  # Convert text dates into proper Date format
+  mutate(date = mdy(date)) %>%
+  # Rename Admin2 to County for clarity
+  rename(County = Admin2) %>%
+  # Drop extra columns we don’t need
+  select(-any_of(c("Lat","Long_","UID","iso2","iso3","code3","FIPS"))) %>%
+  # Keep only rows with at least 1 death
+  filter(deaths >= 1)
+
+
+
+```
+
+Lets check the first 10 rows of the clean us_death data frame.
+
+```{r check-dataframe 6}
+
+head(us_deaths, n = 10)
+
+```
+
+**What this step does:**
+
+* Standardizes the key fields (`Country_Region`, `Province_State`, `date`) in both US datasets so they line up for joining.
+* Aggregates raw rows to a single total per (Country, State, Date) for **cases** and **deaths** separately.
+* Joins cases and deaths into one table `total_us` using the shared keys.
+
+```{r join-us-cases-deaths}
+
+# Standardize keys (no County, no Population)
+std_keys_us <- function(df) {
+  df %>%
+    mutate(
+      Country_Region = str_trim(as.character(Country_Region)),
+      Province_State = if_else(is.na(Province_State) | Province_State == "",
+                               "All", as.character(Province_State)),
+      date = as.Date(date)
+    )
+}
+
+# Apply cleaning (keep raw values as-is; drop Combined_Key if present)
+us_cases  <- std_keys_us(us_cases)  %>% select(-any_of("Combined_Key"))
+us_deaths <- std_keys_us(us_deaths)
+
+# Aggregate by (Country, State, Date)
+cases_us <- us_cases %>%
+  group_by(Country_Region, Province_State, date) %>%
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+deaths_us <- us_deaths %>%
+  group_by(Country_Region, Province_State, date) %>%
+  summarise(deaths = sum(deaths, na.rm = TRUE), .groups = "drop")
+
+# Join counts (some dates may be NA on one side if truly missing in source)
+total_us <- full_join(
+  cases_us, deaths_us,
+  by = c("Country_Region", "Province_State", "date")
+)
+
+
+```
+
+Lets check the clean data frame for total_us.
+
+```{r check-dataframe7}
+
+head(total_us)
+
+```
+
+**What this step does:**
+
+* Aligns the schemas of the global dataset and the U.S. dataset so they share the same columns (`Country_Region`, `Province_State`, `date`, `cases`, `deaths`).
+* Removes rows for the United States from the global dataset to avoid double-counting.
+* Appends the U.S. rows (from the dedicated U.S. dataset) back into the global dataset.
+* Produces a unified `world` dataframe that contains all countries, with U.S. data sourced consistently from the richer U.S. feed.
+* Sorts the combined dataset by `Country_Region`, `Province_State`, and `date` for downstream time-series analysis.
+* Drops rows where `cases` is `NA`, since missingness is less than one percent.
+* Filters out non-country values from the `Country_Region` column (e.g., cruise ships, Olympics).
+* Filters out invalid values from the `Province_State` column (e.g., cruise ships, repatriated travellers, unknown).
+
+```{r combine-global-and-us}
+
+# Create vector list of non-country regions (to drop from Country_Region)
+non_country_regions <- c(
+  "Diamond Princess", "MS Zaandam",
+  "Summer Olympics 2020", "Winter Olympics 2022"
+)
+
+# Create vector list of invalid Province_State entries
+bad_province <- c(
+  "Diamond Princess", "Grand Princess",
+  "Repatriated Travellers", "Unknown"
+)
+
+# 1) Align schemas (no Population column)
+global_ready <- global %>%
+  select(Country_Region, Province_State, date, cases, deaths)
+
+us_ready <- total_us %>%
+  select(Country_Region, Province_State, date, cases, deaths)
+
+# 2) Remove US from global to avoid double-counting
+global_non_us <- global_ready %>% filter(Country_Region != "US")
+
+# 3) Append US rows to the rest of the world
+world <- bind_rows(global_non_us, us_ready) %>%
+  arrange(Country_Region, Province_State, date)
+
+# 4) Drop rows where cases is NA and filter out non-country & invalid province/state values
+world <- world %>%
+  filter(!is.na(cases)) %>%
+  filter(!Country_Region %in% non_country_regions) %>%
+  filter(!Province_State %in% bad_province)
+
+```
+
+Lets take a look at the world data frame.
+
+```{r}
+
+head(world)
+
+```
+
+**What this step does:**
+
+* Replaces missing `deaths` values within each (`Country_Region`, `Province_State`) group using that group’s median.
+* Checks the percentage of missing values remaining after province/state-level imputation.
+* For any rows still missing, replaces `deaths` with the median value for the entire country.
+* Checks the percentage of missing values remaining after country-level imputation.
+* Drops any remaining rows where `deaths` is still missing (very small fraction, edge cases).
+* Confirms that the final dataset has 0% missing values in the `deaths` column.
+
+```{r impute-deaths-column}
+
+# — Step 1: Impute missing deaths using Province/State median —
+# For each Country + Province/State, replace NA values in deaths 
+# with the median value of that group.
+world_step1 <- world %>%
+  group_by(Country_Region, Province_State) %>%
+  mutate(
+    deaths = ifelse(
+      is.na(deaths),
+      median(deaths, na.rm = TRUE),  # stays NA if the whole group has no deaths
+      deaths
+    )
+  ) %>%
+  ungroup()
+
+# Check how many % of NA values remain after Step 1
+pct_na_after_step1 <- mean(is.na(world_step1$deaths)) * 100
+cat(sprintf("After Step 1 (Province/State median): %.3f%% NA in deaths\n", pct_na_after_step1))
+
+
+# — Step 2: Impute remaining NAs using Country-level median —
+# For any deaths that are still NA, use the median value of the country overall.
+country_medians <- world_step1 %>%
+  group_by(Country_Region) %>%
+  summarise(country_med = median(deaths, na.rm = TRUE), .groups = "drop")
+
+world_clean <- world_step1 %>%
+  left_join(country_medians, by = "Country_Region") %>%
+  mutate(
+    deaths = ifelse(is.na(deaths), country_med, deaths)
+  ) %>%
+  select(-country_med)
+
+# Check how many % of NA values remain after Step 2
+pct_na_after_step2 <- mean(is.na(world_clean$deaths)) * 100
+cat(sprintf("After Step 2 (Country median fallback): %.3f%% NA in deaths\n", pct_na_after_step2))
+
+
+# — Step 3: Drop any rows still missing after both imputations —
+# At this point, only a tiny fraction should remain NA (edge cases). 
+# Therefore, I remove those rows completely.
+world_final <- world_clean %>%
+  filter(!is.na(deaths))
+
+# Confirm if I now have 0% NA values in deaths
+cat(sprintf("Final (after drop): %.3f%% NA in deaths\n", 
+            mean(is.na(world_final$deaths)) * 100))
+
+```
+
+------------------------------------------------------------------------
+
+# **Exploratory Data Analysis**
+
+**What this step does:**
+* Plot the top 10 categories for the Country_Region and Province_State columns.
+
+```{r count-plots-top-10}
+
+# Top 10 Country_Region by row count
+country_counts <- world_final %>%
+  count(Country_Region, sort = TRUE) %>%
+  slice_max(n, n = 10)
+
+ggplot(country_counts, aes(x = reorder(Country_Region, n), y = n, fill = Country_Region)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Top 10 Countries by Row Count",
+       x = "Country",
+       y = "Row Count") +
+  scale_fill_viridis_d(option = "plasma")   # handles unlimited categories
+
+# Top 10 Province_State by row count (all one color for clarity)
+province_counts <- world_final %>%
+  count(Province_State, sort = TRUE) %>%
+  slice_max(n, n = 10)
+
+ggplot(province_counts, aes(x = reorder(Province_State, n), y = n)) +
+  geom_col(fill = "green") +
+  coord_flip() +
+  labs(title = "Top 10 Provinces/States by Row Count",
+       x = "Province/State",
+       y = "Row Count")
+
+```
+
+**What this step does:**
+
+* Removes rows where `Province_State` equals `"All"`, since this category represents country-level aggregates that duplicate information already captured by `Country_Region`.
+* Eliminates a major class imbalance caused by the overwhelming number of `"All"` rows, which would otherwise dominate analyses and clustering.
+* Produces a cleaner dataset where provinces/states reflect only subnational regions.
+* Recomputes and plots the top 10 `Country_Region` and `Province_State` counts to confirm balanced distributions after filtering.
+
+```{r filter-out-All}
+
+world_final <- world_final %>%
+  filter(Province_State != "All")
+
+# Top 10 Country_Region by row count (each country its own color)
+country_counts <- world_final %>%
+  count(Country_Region, sort = TRUE) %>%
+  slice_max(n, n = 10)
+
+ggplot(country_counts, aes(x = reorder(Country_Region, n), y = n, fill = Country_Region)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Top 10 Countries by Row Count",
+       x = "Country",
+       y = "Row Count") +
+  scale_fill_viridis_d(option = "plasma")
+
+# Top 10 Province_State by row count (each province/state its own color)
+province_counts <- world_final %>%
+  count(Province_State, sort = TRUE) %>%
+  slice_max(n, n = 10)
+
+ggplot(province_counts, aes(x = reorder(Province_State, n), y = n, fill = Province_State)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Top 10 Provinces/States by Row Count",
+       x = "Province/State",
+       y = "Row Count") +
+  scale_fill_viridis_d(option = "cividis")
+
+
+```
+
+------------------------------------------------------------------------
+
+```{r cases-death-distributions}
+
+# Calculate summary stats for cases
+mean_cases <- mean(world_final$cases, na.rm = TRUE)
+median_cases <- median(world_final$cases, na.rm = TRUE)
+
+ggplot(world_final, aes(x = cases)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 fill = "steelblue", color = "white", bins = 50, alpha = 0.6) +
+  geom_density(color = "black", size = 1) +
+  geom_vline(xintercept = mean_cases, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = median_cases, color = "green", linetype = "dashed", size = 1) +
+  scale_x_log10() +
+  labs(title = "Distribution of Cases (Log Scale)",
+       x = "Cases (log10)",
+       y = "Density",
+       caption = "Red = Mean, Green = Median") +
+  theme_minimal()
+
+# Calculate summary stats for deaths
+mean_deaths <- mean(world_final$deaths, na.rm = TRUE)
+median_deaths <- median(world_final$deaths, na.rm = TRUE)
+
+ggplot(world_final, aes(x = deaths)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 fill = "darkred", color = "white", bins = 50, alpha = 0.6) +
+  geom_density(color = "black", size = 1) +
+  geom_vline(xintercept = mean_deaths, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = median_deaths, color = "green", linetype = "dashed", size = 1) +
+  scale_x_log10() +
+  labs(title = "Distribution of Deaths (Log Scale)",
+       x = "Deaths (log10)",
+       y = "Density",
+       caption = "Red = Mean, Green = Median") +
+  theme_minimal()
+
+# Compute summary statistics:
+summary(world_final)
+
+```
+
+**What this step does:**
+
+* Plots the distribution of COVID-19 **cases** and **deaths** using histograms.  
+* Applies a **log scale** to the x-axis so small and large values can be compared on the same plot.  
+* Overlays a **density curve** to show the smoothed shape of the distribution.  
+* Adds **vertical dashed lines**:
+  * **Red = Mean** (average value across all rows).
+  * **Green = Median** (middle value, less sensitive to extreme outliers).
+* Compute dataset summary statistics.
+
+**What we see:**
+
+* Both **cases** and **deaths** are **highly right-skewed** (most values are small, with a few extremely large outbreaks).  
+* The **mean (red line)** is much farther to the right than the **median (green line)**, confirming the influence of extreme outliers (e.g., U.S., China, India).  
+* Multiple peaks are visible in the density curves, suggesting waves or clusters of outbreak sizes rather than a single smooth distribution.  
+* Using a log scale reveals structure that would be hidden if plotted on a raw scale (where the largest values dominate).  
+* The dataset covers ~154k rows across countries and provinces, spanning from **Jan 2020 to Mar 2023**.  
+* **Cases**:  
+  * Median ≈ 12k vs Mean ≈ 396k → shows strong right skew with extreme outbreak values.  
+  * Maximum case count exceeds **12 million** in a single record.  
+* **Deaths**:  
+  * Median ≈ 107 vs Mean ≈ 5k → also highly skewed.  
+  * Maximum deaths exceed **100k** in a single record.  
+* Quartiles (1st, Median, 3rd) for both cases and deaths are much lower than the max, confirming that a few extreme events dominate the averages.  
+* Dates align with expected pandemic timeline — multiple waves visible when combined with plots.  
+
+------------------------------------------------------------------------
+
+# **Feature Engineering**
+
+```{r feature-engineering}
+
+# Helper to get first nonzero value (avoids divide-by-zero in growth rates)
+first_nonzero <- function(x) {
+  ix <- which(x > 0)[1]
+  if (is.na(ix)) 0 else x[ix]
+}
+
+# 1) Compute daily new cases/deaths from cumulative, per region
+#    - Sort by date
+#    - Diff the cumulative
+#    - Floor negative corrections at 0 (reporting revisions)
+world_daily <- world_final %>%
+  arrange(Country_Region, Province_State, date) %>%
+  group_by(Country_Region, Province_State) %>%
+  mutate(
+    new_cases  = pmax(cases  - lag(cases,  default = first(cases)),  0),
+    new_deaths = pmax(deaths - lag(deaths, default = first(deaths)), 0)
+  ) %>%
+  ungroup()
+
+# 2) Summarize each region into clustering features (epidemic dynamics)
+features <- world_daily %>%
+  group_by(Country_Region, Province_State) %>%
+  summarise(
+    # Cumulative-level endpoints
+    total_cases   = max(cases,  na.rm = TRUE),
+    total_deaths  = max(deaths, na.rm = TRUE),
+    cfr           = ifelse(max(cases, na.rm = TRUE) > 0,
+                           max(deaths, na.rm = TRUE) / max(cases, na.rm = TRUE), 0),
+
+    # Daily flow stats (level & volatility)
+    mean_daily_cases   = mean(new_cases,  na.rm = TRUE),
+    sd_daily_cases     = sd(new_cases,    na.rm = TRUE),
+    mean_daily_deaths  = mean(new_deaths, na.rm = TRUE),
+    sd_daily_deaths    = sd(new_deaths,   na.rm = TRUE),
+
+    # Peaks (intensity of largest waves)
+    peak_daily_cases   = max(new_cases,   na.rm = TRUE),
+    peak_daily_deaths  = max(new_deaths,  na.rm = TRUE),
+
+    # Simple growth proxy across the whole period (robust to zeros)
+    cases_first_nonzero  = first_nonzero(cases),
+    deaths_first_nonzero = first_nonzero(deaths),
+    growth_cases  = (last(cases)  + 1) / (cases_first_nonzero  + 1),
+    growth_deaths = (last(deaths) + 1) / (deaths_first_nonzero + 1),
+
+    # Coefficient of variation (volatility normalized by level)
+    cv_daily_cases  = ifelse(mean_daily_cases  > 0, sd_daily_cases  / mean_daily_cases,  NA_real_),
+    cv_daily_deaths = ifelse(mean_daily_deaths > 0, sd_daily_deaths / mean_daily_deaths, NA_real_),
+
+    .groups = "drop"
+  ) %>%
+  # Clean up helper columns not needed downstream
+  select(-cases_first_nonzero, -deaths_first_nonzero) %>%
+  # Replace any remaining NaNs/Infs from 0/0 with 0
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.x), .x, 0)))
+
+# 3) log-transform heavy-tailed totals to stabilize scale
+features <- features %>%
+  mutate(
+    total_cases_log  = log1p(total_cases),
+    total_deaths_log = log1p(total_deaths),
+    peak_cases_log   = log1p(peak_daily_cases),
+    peak_deaths_log  = log1p(peak_daily_deaths)
+  )
+
+# 4) Build the scaled matrix for clustering (drop IDs, keep engineered numerics)
+feature_matrix <- features %>%
+  select(-Country_Region, -Province_State) %>%
+  mutate(across(everything(), ~ replace_na(.x, 0))) %>%
+  scale() %>%
+  as.data.frame()
+
+# 5) Keep an ID mapping so you can join cluster labels back later
+feature_ids <- features %>% select(Country_Region, Province_State)
+
+```
+
+**What this step does:**
+
+* Defines a small helper `first_nonzero()` to safely find the first positive cumulative value (prevents divide-by-zero in growth rates).
+* Computes **daily new cases/deaths** per region by differencing the cumulative series, floors negative revisions to 0, and preserves time order.
+* Aggregates each (`Country_Region`, `Province_State`) into **clustering features**:
+  * *Level*: `total_cases`, `total_deaths`, and case-fatality ratio `cfr = deaths / cases` (guarded against zeros).
+  * *Flow & volatility*: means and standard deviations of `new_cases` and `new_deaths`.
+  * *Intensity*: `peak_daily_cases`, `peak_daily_deaths`.
+  * *Growth*: `growth_cases`, `growth_deaths` using first nonzero to last (robust to leading zeros).
+  * *Stability*: coefficients of variation `cv_daily_cases`, `cv_daily_deaths`.
+* Cleans helper columns and replaces any non-finite values (NaN/Inf from 0/0) with 0 to keep features numeric and well-defined.
+* Applies **log1p transforms** to heavy-tailed totals and peaks to stabilize scale for distance-based clustering.
+* Builds the **scaled feature matrix** (`feature_matrix`) by dropping identifiers, filling any remaining NAs with 0, and standardizing all numeric features.
+* Saves an **ID mapping** (`feature_ids`) with `Country_Region` and `Province_State` so cluster labels can be joined back after modeling.
+
+------------------------------------------------------------------------
+
+# **Statistical Modeling**
+
+```{r compute-optimal-k-clusters}
+
+# --- Elbow method: compute WSS (within-cluster sum of squares) across k values ---
+set.seed(123)   # set random seed so results are reproducible
+ks  <- 2:12     # test cluster sizes from 2 up to 12
+wss <- sapply(ks, function(k) {
+  kmeans(feature_matrix, centers = k, nstart = 25)$tot.withinss
+})
+elbow_df <- data.frame(k = ks, wss = wss)   # store results in a data frame
+
+# --- Find the "elbow" point (knee) automatically ---
+# The elbow is where WSS stops dropping quickly (best balance of fit vs complexity).
+A <- c(elbow_df$k[1],  elbow_df$wss[1])                     # first point on curve
+B <- c(elbow_df$k[nrow(elbow_df)], elbow_df$wss[nrow(elbow_df)]) # last point on curve
+
+# function to compute distance of each point from the line connecting A and B
+line_dist <- function(x, y, A, B) {
+  abs((B[2]-A[2]) * x - (B[1]-A[1]) * y + B[1]*A[2] - B[2]*A[1]) /
+    sqrt((B[2]-A[2])^2 + (B[1]-A[1])^2)
+}
+
+# calculate distances and choose k with the largest distance
+dists <- mapply(line_dist, elbow_df$k, elbow_df$wss,
+                MoreArgs = list(A = A, B = B))
+k_elbow <- elbow_df$k[which.max(dists)]
+message(sprintf("Elbow detected at k = %d", k_elbow))
+
+# --- Plot the elbow curve and mark the chosen k ---
+print(
+  ggplot(elbow_df, aes(x = k, y = wss)) +
+    geom_line() +
+    geom_point(size = 2) +
+    geom_vline(xintercept = k_elbow, linetype = "dashed", color = "red") +
+    annotate("text", x = k_elbow, y = max(wss),
+             label = paste0("Elbow k = ", k_elbow),
+             vjust = -0.5, color = "red") +
+    labs(title = "Elbow Method for k-means",
+         x = "Number of clusters (k)",
+         y = "Total within-cluster sum of squares (WSS)") +
+    theme_minimal()
+)
+
+```
+
+**What this step does:**
+
+* Runs k-means clustering for a range of candidate cluster counts (k = 2 to 12).  
+* Records the total within-cluster sum of squares (WSS) for each k in a data frame.  
+* Defines a helper function `line_dist()` to measure the distance of each point from the straight line between the smallest and largest k values.  
+* Selects the k with the largest distance from this line as the "elbow" — the point where adding more clusters yields diminishing returns.  
+* Prints the chosen elbow k and produces a plot of WSS vs. k with the elbow highlighted in red.  
+
+**What we see:**
+
+* WSS decreases rapidly for small k and then flattens out, showing diminishing improvement.  
+* The elbow method automatically identifies the optimal k (here k = 5) as the balance between simplicity and explanatory power.  
+* The plot clearly marks this elbow point with a red dashed vertical line and annotation.  
+
+------------------------------------------------------------------------
+
+```{r k-means-clustering}
+
+# --- Run k-means clustering on the engineered features ----------------------
+
+set.seed(123)   # ensure reproducibility
+
+# Perform k-means clustering:
+#   - feature_matrix: numeric features we engineered & scaled
+#   - centers = 5: number of clusters (k = 5, chosen via elbow method)
+#   - nstart = 100: run algorithm 100 times with different random starts
+#       (helps ensure a more stable and reliable solution)
+km <- kmeans(feature_matrix, centers = 5, nstart = 100)
+
+# Store results:
+#   - Extract cluster assignments (1–5)
+#   - Join them back to region identifiers (Country/Province)
+clusters <- tibble(cluster = km$cluster) %>% 
+  bind_cols(feature_ids)
+
+# Preview the first few rows of cluster assignments
+head(clusters)
+
+```
+
+**What this step does:**
+
+* Groups regions into 5 clusters based on epidemic dynamics.
+* Uses multiple random starts (nstart = 100) to improve stability of results.
+* Joins the cluster label back to each Country/Region and Province/State for interpretation.
+* Provides a preview of the first few assignments.
+
+------------------------------------------------------------------------
+
+```{r pca}
+
+# PCA on the scaled feature matrix (already scaled -> no need to center/scale again)
+pca <- prcomp(feature_matrix, center = FALSE, scale. = FALSE)
+
+# Variance explained (for axis labels)
+ve <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+# Build a plot-ready data frame
+pca_df <- as.data.frame(pca$x[, 1:2]) %>%
+  setNames(c("PC1","PC2")) %>%
+  bind_cols(feature_ids, cluster = factor(km$cluster))
+
+# Scatter plot of first two PCs
+ggplot(pca_df, aes(PC1, PC2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  labs(
+    title = "PCA of Regions (colored by k-means cluster)",
+    x = sprintf("PC1 (%.1f%% var.)", ve[1]),
+    y = sprintf("PC2 (%.1f%% var.)", ve[2]),
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+```
+
+**What this step does:**
+
+* Runs PCA (Principal Component Analysis) on the scaled feature matrix to reduce dimensionality.  
+* Computes the percentage of variance explained by the first two principal components (PC1, PC2).  
+* Creates a tidy data frame with PC1, PC2 coordinates, region identifiers, and assigned cluster labels.  
+* Plots a scatterplot of PC1 vs PC2, coloring points by their k-means cluster assignment.  
+
+**What we see:**
+
+* PC1 explains most of the variance (~57.6%), while PC2 adds additional (~11.0%), together capturing much of the data structure.  
+* Regions with similar epidemic dynamics cluster together in PCA space, confirming the k-means groupings.  
+* Clear separation between clusters indicates that the engineered features (growth, volatility, peaks, etc.) capture meaningful differences across regions.  
+* Some overlap between clusters suggests gradual transitions rather than perfectly distinct groups, which is common in real-world epidemiological data.
+
+------------------------------------------------------------------------
+
+```{r visualize-cluster-sizes}
+
+# Convert the cluster assignments into a tibble and count how many regions fall in each cluster
+clusters_sizes <- tibble(cluster = factor(km$cluster)) %>%
+  count(cluster)
+
+# Plot the number of regions per cluster as a bar chart
+ggplot(clusters_sizes, aes(x = cluster, y = n, fill = cluster)) +
+  geom_col(show.legend = FALSE) +  # draw bars; hide legend since clusters are already labeled
+  labs(title = "Cluster Sizes", x = "Cluster", y = "Regions") +
+  theme_minimal()  # clean theme for a simple look
+
+```
+# **What this step does:**
+
+* Counts how many regions fall into each cluster.
+* Creates a simple bar chart showing the distribution of cluster sizes.
+
+**Interpretation:**
+* Cluster 4 and Cluster 5 contain the largest number of regions, suggesting these are broad, general groupings.
+* Cluster 1 has a moderate number of regions, while Clusters 2 and 3 are very small, possibly containing outliers or unique epidemic patterns.
+* This imbalance can be important — large clusters suggest common trends, while small clusters may highlight unusual or extreme cases.
+
+------------------------------------------------------------------------
+
+```{r heat-map}
+
+# Join cluster labels back to raw engineered features
+features_with_cluster <- features %>%
+  select(Country_Region, Province_State, everything()) %>%
+  left_join(
+    feature_ids %>% mutate(cluster = factor(km$cluster)),
+    by = c("Country_Region","Province_State")
+  )
+
+cluster_means <- features_with_cluster %>%
+  select(-Country_Region, -Province_State) %>%
+  group_by(cluster) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+
+# Make a tidy long table and (optionally) z-score by column for comparability
+cluster_means_long <- cluster_means %>%
+  pivot_longer(-cluster, names_to = "feature", values_to = "value") %>%
+  group_by(feature) %>%
+  mutate(z = (value - mean(value)) / sd(value)) %>%  # standardize within each feature
+  ungroup()
+
+# Heatmap (z-scored means so color is comparable across features)
+ggplot(cluster_means_long, aes(x = feature, y = cluster, fill = z)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B") +
+  labs(title = "Cluster Profiles (z-scored feature means)",
+       x = "Feature", y = "Cluster", fill = "z-score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+**What this step does:**
+
+* Aggregates each cluster’s average values across all engineered features.
+* Standardizes (z-scores) so features are on the same scale, enabling comparison.
+* Plots a heatmap where:
+    - Red = higher-than-average values for that feature.
+    - Blue = lower-than-average values for that feature.
+
+**Interpretation:**
+
+* Cluster 3 shows consistently high values across most features (red), indicating regions with **large outbreaks and strong epidemic dynamics**.
+* Cluster 4 stands out with a **high case fatality ratio (CFR)** and volatility in deaths, suggesting regions with **severe death impact relative to cases**.
+* Cluster 1 and Cluster 2 show mostly blue (lower-than-average values), representing **regions with smaller outbreaks or stable dynamics**.
+* Cluster 5 is relatively neutral/close to average across most features, acting as a **baseline or mixed group**.
+* This profile view highlights how clusters differ in epidemic patterns — some dominated by growth and peaks, others by severity or stability.
+
+------------------------------------------------------------------------
+
+# **Conclusion and Bias Considerations**
+
+**Conclusion:**
+
+* This project used the Johns Hopkins CSSE COVID-19 dataset to explore global case and death trends.
+* After cleaning and imputing missing values, we engineered features such as growth, volatility, peaks, and case fatality ratios.  
+* K-means clustering (k = 5, chosen via elbow method) grouped regions into distinct patterns of epidemic dynamics.  
+* PCA visualizations confirmed meaningful separation between clusters, while heatmaps highlighted the unique feature profiles driving each grouping.  
+* These results demonstrate how unsupervised learning can reveal **latent structure in pandemic data**, helping identify regions with similar outbreak characteristics.  
+
+**Bias and Limitations:**
+
+* **Reporting inconsistencies**: COVID-19 data quality varies widely across countries, with underreporting or delays affecting accuracy.  
+* **Population size differences**: Larger countries naturally report higher totals; normalization (per capita) would improve fairness of comparisons.  
+* **Evolving dynamics**: The dataset reflects pandemic patterns through 2023, but clustering results may shift with new waves or variants.  
+* **Methodological choices**: Using k-means assumes spherical clusters and equal variance, which may oversimplify real-world epidemic patterns.  
+* **Missing context**: Non-epidemiological factors (e.g., healthcare infrastructure, vaccination rates, policies) were not included, limiting interpretability.  
+
+**Final Note:**
+
+* Despite these limitations, the project provides a valuable starting point for understanding global COVID-19 dynamics.  
+* Results should be interpreted as **exploratory insights**, not definitive epidemiological conclusions.  
+
